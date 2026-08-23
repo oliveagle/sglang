@@ -34,6 +34,7 @@ Usage:
         --dist-init-method tcp://127.0.0.1:29500
 """
 
+import hashlib
 import logging
 import os
 import signal
@@ -63,6 +64,7 @@ from .protocol import (
     recv_msg,
     send_msg,
 )
+import msgspec  # ole-eval ADR-0001 lxm.1.2: msgpack for meta_payload
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +125,9 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> {"handle": base64_str, "shape": list, "dtype": str, "is_param": bool}
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        # ole-eval ADR-0001 lxm.1.2
+        self.meta_payload = None  # type: Optional[bytes]
+        self.meta_path = None  # type: Optional[str]
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -311,10 +316,75 @@ class WeightCacheDaemon:
         # Export all parameters and buffers as IPC handles
         self._export_state()
 
+        # ole-eval ADR-0001 lxm.1.2: build meta BEFORE the "ready" log
+        self._export_meta()
+
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
             f"Exported {len(self.state_entries)} tensors as IPC handles. "
             f"Ready to serve."
+        )
+
+    # ------------------------------------------------------------------
+    # ole-eval ADR-0001 lxm.1.2: meta export
+    # ------------------------------------------------------------------
+
+    def _build_meta_payload(self):
+        """Build the post-process meta payload (msgpack-encoded)."""
+        tensors = {}
+        for name, entry in self.state_entries.items():
+            tensors[name] = {
+                "shape": list(entry["shape"]),
+                "dtype": entry["dtype"],
+                "is_param": bool(entry["is_param"]),
+            }
+        meta = {
+            "schema_version": 1,
+            "model_arch": self.config.model_arch,
+            "tp_size": self.tp_size,
+            "tp_rank": self.tp_rank,
+            "pp_size": self.pp_size,
+            "pp_rank": self.pp_rank,
+            "quant_method": self.config.quant_method,
+            "quant_config_hash": self.config.quant_config_hash,
+            "dtype": self.config.dtype,
+            "revision": self.config.revision,
+            "tensor_count": len(self.state_entries),
+            "tensors": tensors,
+            "env_stamp": compute_env_stamp(),
+        }
+        # Canonical form for fingerprint: sort top-level keys + recursively
+        # normalize nested dicts via msgspec.to_builtins. msgspec.msgpack
+        # does NOT guarantee key order across runs, so we MUST canonicalize
+        # before hashing.
+        import json as _json
+        sorted_meta = {k: meta[k] for k in sorted(meta.keys())}
+        canonical = _json.dumps(
+            msgspec.to_builtins(sorted_meta),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        fingerprint = hashlib.sha256(canonical).hexdigest()
+        meta["fingerprint_sha256"] = fingerprint
+        return msgspec.msgpack.encode(meta)
+
+    def _export_meta(self):
+        """Build meta payload, persist to .ready.meta, cache in self."""
+        payload = self._build_meta_payload()
+        self.meta_payload = payload
+        meta_path = self.ready_path + ".meta"
+        tmp_path = meta_path + ".tmp"
+        with open(tmp_path, "wb") as f:
+            f.write(payload)
+        os.replace(tmp_path, meta_path)
+        self.meta_path = meta_path
+        decoded = msgspec.msgpack.decode(payload)
+        logger.info(
+            f"[WeightCacheDaemon gpu={self.gpu_id}] "
+            f"Exported meta payload: {len(payload)} bytes, "
+            f"{len(self.state_entries)} tensors, "
+            f"fingerprint={decoded['fingerprint_sha256'][:16]}..., "
+            f"written to {meta_path}"
         )
 
     @staticmethod
@@ -464,6 +534,9 @@ class WeightCacheDaemon:
                 os.unlink(self.socket_path)
             if os.path.exists(self.ready_path):
                 os.unlink(self.ready_path)
+            # ole-eval ADR-0001 lxm.1.2
+            if self.meta_path and os.path.exists(self.meta_path):
+                os.unlink(self.meta_path)
             logger.info(f"[WeightCacheDaemon gpu={self.gpu_id}] Shutdown complete")
 
     def _handle_connection(self, conn: socket.socket):
@@ -505,10 +578,9 @@ class WeightCacheDaemon:
                     "status": "ok",
                     "config": self.config.to_dict(),
                     "entries": self.state_entries,
-                    # PID so the client can watch daemon liveness: if this
-                    # process dies while clients hold IPC mappings, their
-                    # param.data (and any CUDA-graph-captured addresses) dangle.
                     "pid": os.getpid(),
+                    # ole-eval ADR-0001 lxm.1.2
+                    "meta_payload": self.meta_payload,
                 },
             )
 
