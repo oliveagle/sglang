@@ -238,6 +238,104 @@ def check_ipc_quant_support(
 
 MAX_MSG_SIZE = 256 * 1024 * 1024  # 256 MiB
 
+# ole-eval ADR-0001 lxm.1.4: handshake schema + backward-compat shim
+# ----------------------------------------------------------------------
+# The daemon -> client handshake is a length-prefixed pickled dict (see
+# send_msg / recv_msg above). After ADR-0001 lxm.1.2 the dict contains:
+HANDSHAKE_SCHEMA = {
+    # Required (every daemon)
+    "status":   "str: 'ok' | 'mismatch' | 'error'",
+    # Required when status == "ok"
+    "config":   "dict: CacheConfig.to_dict()",
+    "entries":  "dict: {name: {handle: str, shape: list[int], dtype: str, is_param: bool}}",
+    "pid":      "int: daemon os.getpid(); for liveness watchdog",
+    # Optional (added in ADR-0001 lxm.1.2)
+    "meta_payload": "Optional[bytes]: msgpack-encoded post-process meta "
+                    "(see daemon.WeightCacheDaemon._export_meta). "
+                    "None if daemon pre-dates ADR-0001.",
+}
+
+
+def verify_handshake_schema(msg, *, where: str = "client") -> dict:
+    """Validate a received handshake dict against HANDSHAKE_SCHEMA.
+
+    Behavior:
+    - Missing required keys (status / config / entries / pid) -> RuntimeError
+    - Missing optional meta_payload -> logger.warning (daemon pre-ADR-0001)
+    - Extra unknown keys -> logger.debug (forward compat: newer daemon)
+    - Wrong type for a known key -> RuntimeError with actionable message
+
+    Returns the message dict (possibly with meta_payload defaulted to None).
+    """
+    if not isinstance(msg, dict):
+        raise RuntimeError(
+            f"[weight_cache:{where}] handshake is not a dict: {type(msg).__name__}"
+        )
+
+    required_str = {"status"}
+    required_ok = {"config", "entries", "pid"}
+    optional = {"meta_payload"}
+
+    for key in required_str | required_ok:
+        if key not in msg:
+            raise RuntimeError(
+                f"[weight_cache:{where}] handshake missing required field {key!r}. "
+                f"Schema: {HANDSHAKE_SCHEMA}. Got keys: {sorted(msg.keys())}"
+            )
+
+    if not isinstance(msg["status"], str):
+        raise RuntimeError(
+            f"[weight_cache:{where}] handshake 'status' must be str, got "
+            f"{type(msg['status']).__name__}"
+        )
+    if msg["status"] == "ok":
+        for key in required_ok:
+            if not isinstance(msg[key], dict if key in ("config", "entries") else int):
+                # pid must be int; config/entries must be dict
+                expected = "dict" if key in ("config", "entries") else "int"
+                raise RuntimeError(
+                    f"[weight_cache:{where}] handshake 'status=ok' requires "
+                    f"{key!r} to be {expected}, got {type(msg[key]).__name__}"
+                )
+
+    # Backward compat: meta_payload missing -> WARN (daemon pre-ADR-0001)
+    if "meta_payload" not in msg or msg["meta_payload"] is None:
+        logger.warning(
+            "[weight_cache:%s] handshake missing 'meta_payload' (daemon "
+            "pre-dates ADR-0001 lxm.1.2). Falling back to per-tensor shape/dtype "
+            "comparison only — correctness depends on the daemon having "
+            "already verified its quant method via check_ipc_quant_support. "
+            "Set SGLANG_WCD_REQUIRE_META=1 to hard-fail instead of warn.",
+            where,
+        )
+        msg = {**msg, "meta_payload": None}
+    elif not isinstance(msg["meta_payload"], (bytes, bytearray, memoryview)):
+        raise RuntimeError(
+            f"[weight_cache:{where}] handshake 'meta_payload' must be bytes, "
+            f"got {type(msg['meta_payload']).__name__}"
+        )
+
+    # Backward compat: SGLANG_WCD_REQUIRE_META=1 strict mode
+    if os.environ.get("SGLANG_WCD_REQUIRE_META") == "1" and not msg.get("meta_payload"):
+        raise RuntimeError(
+            f"[weight_cache:{where}] SGLANG_WCD_REQUIRE_META=1 set but daemon "
+            f"did not send meta_payload. Daemon pre-dates ADR-0001 lxm.1.2."
+        )
+
+    # Forward compat: unknown extra keys -> DEBUG
+    known = required_str | required_ok | optional
+    extra = set(msg.keys()) - known
+    if extra:
+        logger.debug(
+            "[weight_cache:%s] handshake has %d unknown field(s) %s "
+            "(client pre-dates daemon). Ignoring.",
+            where, len(extra), sorted(extra),
+        )
+
+    return msg
+
+
+
 
 def send_msg(sock, obj: Any) -> None:
     """Send a length-prefixed pickled message over a socket."""
