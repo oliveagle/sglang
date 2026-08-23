@@ -99,6 +99,7 @@ class WeightCacheDaemon:
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         dist_init_method: Optional[str] = None,
+        socket_path: Optional[str] = None,
     ):
         self.model_path = model_path
         self.gpu_id = gpu_id
@@ -116,10 +117,18 @@ class WeightCacheDaemon:
         self.revision = revision
         self.dist_init_method = dist_init_method
 
-        self.socket_path = get_socket_path(
-            compute_global_rank(tp_size, pp_rank, tp_rank)
-        )
-        self.ready_path = get_ready_path(compute_global_rank(tp_size, pp_rank, tp_rank))
+        if socket_path:
+            # Custom socket (per model x GPU): ready file follows the same
+            # convention as stock ({socket_without_.sock}.ready) so every
+            # caller can derive it from the socket path alone.
+            self.socket_path = socket_path
+            base = socket_path[:-5] if socket_path.endswith(".sock") else socket_path
+            self.ready_path = base + ".ready"
+        else:
+            self.socket_path = get_socket_path(
+                compute_global_rank(tp_size, pp_rank, tp_rank)
+            )
+            self.ready_path = get_ready_path(compute_global_rank(tp_size, pp_rank, tp_rank))
 
         self.model = None
         self.config: Optional[CacheConfig] = None
@@ -624,6 +633,7 @@ def run_weight_cache_daemon(
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     dist_init_method: Optional[str] = None,
+    socket_path: Optional[str] = None,
 ):
     """Entry point for running a weight cache daemon process."""
     logging.basicConfig(
@@ -655,6 +665,7 @@ def run_weight_cache_daemon(
         trust_remote_code=trust_remote_code,
         revision=revision,
         dist_init_method=dist_init_method,
+        socket_path=socket_path,
     )
 
     daemon.load()
@@ -950,6 +961,14 @@ if __name__ == "__main__":
         "a single rank.",
     )
     parser.add_argument(
+        "--weight-cache-socket",
+        default=None,
+        help="Custom Unix socket path (per model x GPU). If unset, uses the "
+        "rank-derived /tmp/sglang_weight_cache_rank{global_rank}.sock so only "
+        "one daemon per node is reachable. Set this to host multiple weight "
+        "copies (different models / different GPUs) on one node.",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=1800,
@@ -971,10 +990,20 @@ if __name__ == "__main__":
         # Refuse to clobber a live daemon already holding this rank (mirrors the
         # multi-rank launcher and the engine path, which the multi-rank spawns
         # of this same entrypoint rely on). --force kills and takes over.
-        cleanup_stale_daemon_files(
-            compute_global_rank(args.tp_size, args.pp_rank, tp_rank),
-            force=args.force,
-        )
+        if args.weight_cache_socket:
+            # Custom socket: clean the socket + its .ready directly.
+            cleanup_stale_daemon_files(0, force=args.force)
+            _ready = args.weight_cache_socket
+            if _ready.endswith(".sock"):
+                _ready = _ready[:-5]
+            for _p in (args.weight_cache_socket, _ready + ".ready"):
+                if os.path.exists(_p):
+                    os.unlink(_p)
+        else:
+            cleanup_stale_daemon_files(
+                compute_global_rank(args.tp_size, args.pp_rank, tp_rank),
+                force=args.force,
+            )
         run_weight_cache_daemon(
             model_path=args.model_path,
             gpu_id=gpu_id,
@@ -991,6 +1020,7 @@ if __name__ == "__main__":
             trust_remote_code=args.trust_remote_code,
             revision=args.revision,
             dist_init_method=args.dist_init_method,
+            socket_path=args.weight_cache_socket,
         )
     else:
         # Multi-rank mode: launch daemons for this node's TP ranks
