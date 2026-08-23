@@ -857,6 +857,20 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{memory_start - memory_end:.3f}",
             )
 
+        # ole-eval ADR-0001 lxm.2.3: skip the post-process loop if we're in
+        # IPC-loaded mode. The daemon already ran process_weights_after_loading
+        # on the weights before exporting IPC handles; running it again on the
+        # client would double-repack (AWQ tile repack, GPTQ permute, etc)
+        # and silently corrupt the tensor data.
+        from sglang.srt.weight_cache._ipc_loaded import is_ipc_loaded
+        if is_ipc_loaded():
+            logger.debug(
+                "load_weights_and_postprocess: ipc_loaded flag set, "
+                "skipping per-module process_weights_after_loading loop "
+                "(ADR-0001 lxm.2.3 zero-copy invariant)."
+            )
+            return
+
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:

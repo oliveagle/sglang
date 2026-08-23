@@ -143,6 +143,27 @@ class IpcModelLoader(BaseModelLoader):
             quant_config,
         )
 
+        # ole-eval ADR-0001 lxm.2.3: explicitly mark this load as IPC-loaded
+        # so DefaultModelLoader.load_weights_and_postprocess() skips the
+        # process_weights_after_loading loop. We don't go through that path
+        # at all in IPC mode (we skip _post_load_weights entirely), but
+        # setting the flag here also guards against any future refactor that
+        # might accidentally route IPC-loaded models through DefaultModelLoader.
+        from sglang.srt.weight_cache._ipc_loaded import set_ipc_loaded
+        ipc_token = set_ipc_loaded()
+        try:
+            self._rebuild_stale_views(model)
+        except Exception:
+            from sglang.srt.weight_cache._ipc_loaded import reset_ipc_loaded
+            reset_ipc_loaded(ipc_token)
+            raise
+        # NOTE: ipc_token stays set for the lifetime of this engine process.
+        # That's intentional: all forward() calls in this process use the
+        # IPC-mapped weights, so process_weights_after_loading must stay
+        # skipped globally. If a future feature needs to load additional
+        # weights on the same engine via DefaultModelLoader, it must
+        # explicitly clear the flag for that call.
+
         # Skip _post_load_weights: the daemon already ran
         # process_weights_after_loading on the weights before exporting
         # IPC handles. Running it again would double-process (e.g.,
