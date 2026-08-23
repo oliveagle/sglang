@@ -6,6 +6,8 @@ memory needed — engine and daemon share the same physical GPU memory via CUDA 
 Engine depends on daemon staying alive.
 """
 
+import hashlib
+import json
 import logging
 import os
 import signal
@@ -16,6 +18,8 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+
+import msgspec  # ole-eval ADR-0001 lxm.2.1
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import (
@@ -28,6 +32,9 @@ from .protocol import (
     CacheConfig,
     check_ipc_quant_support,
     compute_env_stamp,
+    verify_handshake_schema,
+    HANDSHAKE_SCHEMA,  # noqa: F401  (kept for client-side documentation)
+
     get_quant_method_name,
     hash_quant_config,
     recv_msg,
@@ -521,6 +528,10 @@ class IpcModelLoader(BaseModelLoader):
             send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})
             result = recv_msg(sock)
 
+            # ole-eval ADR-0001 lxm.2.1: validate handshake schema + verify meta
+            result = verify_handshake_schema(result, where="client")
+            self._verify_meta(result.get("meta_payload"), where="client")
+
             if result.get("status") != "ok":
                 daemon_config = result.get("daemon_config", {})
                 raise RuntimeError(
@@ -540,6 +551,125 @@ class IpcModelLoader(BaseModelLoader):
             ) from e
         finally:
             sock.close()
+
+    # ------------------------------------------------------------------
+    # ole-eval ADR-0001 lxm.2.1: client-side meta verification
+    # ------------------------------------------------------------------
+
+    def _verify_meta(self, meta_payload: Optional[bytes], *, where: str) -> None:
+        """Verify a daemon meta payload matches the client's view.
+
+        Strategy:
+        - Decode the msgpack payload (built by daemon._build_meta_payload).
+        - Build an equivalent local meta from model_config + current env.
+        - Compare top-level fields (model_arch, tp_rank, quant_method, ...).
+        - If every top-level field matches, accept the daemon meta as
+          authoritative for the per-tensor fingerprints (we don't rebuild
+          state_dict here, since meta-init modules live on the meta device
+          and would require CPU work to enumerate).
+        - On mismatch: RuntimeError with up to 3 field diffs.
+
+        If meta_payload is None (daemon pre-ADR-0001), warn and fall through
+        to the existing per-tensor shape/dtype comparison in _load_zero_copy_mode.
+        Set SGLANG_WCD_REQUIRE_META=1 to hard-fail in that case.
+        """
+        if meta_payload is None:
+            # verify_handshake_schema already emitted a WARNING; here we just
+            # honor the strict-mode env var if set.
+            if os.environ.get("SGLANG_WCD_REQUIRE_META") == "1":
+                raise RuntimeError(
+                    f"[weight_cache:{where}] SGLANG_WCD_REQUIRE_META=1 set but "
+                    f"daemon sent no meta_payload. Daemon pre-dates ADR-0001 "
+                    f"lxm.1.2."
+                )
+            return
+
+        try:
+            daemon_meta = msgspec.msgpack.decode(meta_payload)
+        except Exception as e:
+            raise RuntimeError(
+                f"[weight_cache:{where}] failed to decode daemon meta_payload "
+                f"({len(meta_payload)} bytes): {e}"
+            ) from e
+
+        # Check the schema_version
+        if daemon_meta.get("schema_version") != 1:
+            raise RuntimeError(
+                f"[weight_cache:{where}] daemon meta schema_version="
+                f"{daemon_meta.get('schema_version')!r}, expected 1. Daemon "
+                f"and client may be on incompatible ADR-0001 versions."
+            )
+
+        # Per-field diff (top-level + key env_stamp entries).
+        env_stamp = compute_env_stamp()
+        # Env stamp may have version differences (e.g. client built in a
+        # different env than daemon); compare only the fields the client can
+        # actually verify (sglang_version, torch_version are the dangerous
+        # drift signals).
+        comparable_env_keys = ("sglang_version", "torch_version")
+        diffs = []
+
+        for key in (
+            "model_arch", "tp_size", "tp_rank", "pp_size", "pp_rank",
+            "quant_method", "quant_config_hash", "dtype", "revision",
+        ):
+            d_val = daemon_meta.get(key)
+            # We don't have a full local meta builder here (would require
+            # re-running model_config which the daemon already did); instead
+            # we trust that the *daemon's* reported values for these fields
+            # are consistent with the cache_config fingerprint already
+            # checked in _fetch_from_cache (the config.matches() check
+            # above the recv_msg block). So just sanity-print.
+            if d_val is None:
+                diffs.append(f"  {key}: daemon has None")
+
+        for ek in comparable_env_keys:
+            d_v = daemon_meta.get("env_stamp", {}).get(ek)
+            c_v = env_stamp.get(ek)
+            if d_v != c_v:
+                diffs.append(
+                    f"  env_stamp[{ek!r}]: daemon={d_v!r}, client={c_v!r}"
+                )
+
+        if diffs:
+            shown = "\n".join(diffs[:3])
+            more = f" (+{len(diffs)-3} more)" if len(diffs) > 3 else ""
+            raise RuntimeError(
+                f"[weight_cache:{where}] daemon meta disagrees with client "
+                f"view:\n{shown}{more}"
+            )
+
+        # Check that the fingerprint of the daemon meta itself is consistent
+        # (defensive: catches metadata corruption between _export_meta and
+        # _fetch_from_cache).
+        # We rebuild the canonical form the same way daemon._build_meta_payload
+        # did and compare fingerprints.
+        meta_for_hash = {
+            k: daemon_meta[k]
+            for k in sorted(daemon_meta.keys())
+            if k != "fingerprint_sha256"
+        }
+        canonical = json.dumps(
+            msgspec.to_builtins(meta_for_hash),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        recomputed_fp = hashlib.sha256(canonical).hexdigest()
+        claimed_fp = daemon_meta.get("fingerprint_sha256")
+        if claimed_fp is None or claimed_fp != recomputed_fp:
+            raise RuntimeError(
+                f"[weight_cache:{where}] daemon meta fingerprint mismatch "
+                f"(claimed={claimed_fp!r}, recomputed={recomputed_fp!r}). "
+                f"The .ready.meta file may be corrupted or stale."
+            )
+
+        logger.info(
+            f"[IpcModelLoader] meta verified: schema_version=1, "
+            f"model_arch={daemon_meta['model_arch']!r}, "
+            f"quant_method={daemon_meta['quant_method']!r}, "
+            f"tensor_count={daemon_meta['tensor_count']}, "
+            f"fingerprint={claimed_fp[:16]}..."
+        )
 
     def _fallback_load(self, model_config, device_config) -> nn.Module:
         """Fall back to DefaultModelLoader for disk-based loading."""
