@@ -81,7 +81,7 @@ cvt.rs.f16x2.f32 $0, $2, $1, $3;
         is not None
     }
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", 'A_ptr', 'B_ptr', 'C_ptr', 'D_ptr', 'cache_ptr', 'dt_bias_ptr', 'dt_ptr', 'intermediate_state_indices_ptr', 'out_ptr', 'parent_ptr', 'rand_seed_ptr', 'retrieve_parent_token_ptr', 'state_batch_indices_ptr', 'state_ptr', 'x_ptr', 'z_ptr'])
 def _selective_scan_update_kernel(
     # Pointers to matrices
     state_ptr,

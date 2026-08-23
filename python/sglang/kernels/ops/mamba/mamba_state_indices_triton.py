@@ -13,21 +13,12 @@ MTP inter-phase seam:
 
 This module fuses that chain into a single launch.
 """
-
 import torch
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def _fused_replay_state_indices_kernel(
-    req_pool_indices_ptr,  # (total_bs,) int64 — static replay buffer
-    mamba_map_ptr,  # (req_pool_size,) int32 — req_index_to_mamba_index_mapping
-    out_ptr,  # (total_bs,) int32 — state_indices_list[bs - 1]
-    valid_bs,
-    total_bs,
-    BS_UPPER: tl.constexpr,
-):
+@triton.jit(do_not_specialize=['mamba_map_ptr', 'out_ptr', 'req_pool_indices_ptr'])
+def _fused_replay_state_indices_kernel(req_pool_indices_ptr, mamba_map_ptr, out_ptr, valid_bs, total_bs, BS_UPPER: tl.constexpr):
     offs = tl.arange(0, BS_UPPER)
     in_range = offs < total_bs
     valid = offs < valid_bs
@@ -35,21 +26,10 @@ def _fused_replay_state_indices_kernel(
     idx = tl.load(mamba_map_ptr + req, mask=valid, other=0)
     out_val = tl.where(valid, idx.to(tl.int32), -1)
     tl.store(out_ptr + offs, out_val, mask=in_range)
-    # Preserve the reference chain's side effect: padded rows of the static
-    # req_pool_indices buffer are zeroed so captured kernels that gather
-    # with them stay in-bounds.
     zeros = tl.zeros([BS_UPPER], dtype=req.dtype)
-    tl.store(req_pool_indices_ptr + offs, zeros, mask=in_range & (~valid))
+    tl.store(req_pool_indices_ptr + offs, zeros, mask=in_range & ~valid)
 
-
-def fused_replay_state_indices(
-    *,
-    req_pool_indices: torch.Tensor,
-    mamba_index_mapping: torch.Tensor,
-    out_state_indices: torch.Tensor,
-    valid_bs: int,
-    total_bs: int,
-) -> torch.Tensor:
+def fused_replay_state_indices(*, req_pool_indices: torch.Tensor, mamba_index_mapping: torch.Tensor, out_state_indices: torch.Tensor, valid_bs: int, total_bs: int) -> torch.Tensor:
     """Fill the captured replay state-indices buffer in one launch.
 
     Mapping gather + padding sentinel + store into ``out_state_indices``, plus
@@ -64,12 +44,5 @@ def fused_replay_state_indices(
 
     Returns the filled ``out_state_indices[:total_bs]`` view.
     """
-    _fused_replay_state_indices_kernel[(1,)](
-        req_pool_indices,
-        mamba_index_mapping,
-        out_state_indices,
-        valid_bs,
-        total_bs,
-        BS_UPPER=triton.next_power_of_2(total_bs),
-    )
+    _fused_replay_state_indices_kernel[1,](req_pool_indices, mamba_index_mapping, out_state_indices, valid_bs, total_bs, BS_UPPER=triton.next_power_of_2(total_bs))
     return out_state_indices[:total_bs]
