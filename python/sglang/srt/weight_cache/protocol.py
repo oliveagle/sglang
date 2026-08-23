@@ -163,37 +163,71 @@ IPC_QUANT_ALLOWLIST = {
 }
 
 
+# ole-eval ADR-0001 lxm.1.1: replace upstream hard-error gate with
+# warning-only gate; correctness is restored by daemon-side _export_meta()
+# + client-side _verify_meta() handshake introduced in the same change set.
+# Set SGLANG_WCD_STRICT_QUANT=1 to restore upstream behavior.
+
+
 def is_ipc_quant_supported(quant_method: str, quant_config: Any) -> bool:
-    """Return True if `quant_method` is verified safe for IPC zero-copy sharing."""
-    predicate = IPC_QUANT_ALLOWLIST.get(quant_method)
-    if predicate is None:
-        return False
-    return bool(predicate(quant_config))
+    """Return True if `quant_method` is safe for IPC zero-copy sharing.
+
+    ole-eval (ADR-0001 lxm.1.1): defaults to True for any quant_method not in
+    the explicit allowlist. Callers that want the upstream strict behavior
+    should inspect `quant_method in IPC_QUANT_ALLOWLIST` directly.
+    """
+    if quant_method in IPC_QUANT_ALLOWLIST:
+        return bool(IPC_QUANT_ALLOWLIST[quant_method](quant_config))
+    # ADR-0001: allow any quantization; verifier does the rest.
+    return True
 
 
 def check_ipc_quant_support(
     quant_method: str, quant_config: Any, *, where: str
 ) -> None:
-    """Hard-error unless `quant_method` is verified safe for IPC zero-copy sharing.
+    """Verify `quant_method` is safe for IPC zero-copy sharing.
 
-    `where` is a short tag (e.g. "daemon"/"client") used only in the error
-    message. Raises UnsupportedQuantForIPCError with an actionable message.
+    ole-eval (ADR-0001 lxm.1.1): replaces the upstream hard-error with a
+    WARNING log. Unknown quant methods proceed; correctness is enforced later
+    by the daemon -> client meta verification handshake
+    (sglang.srt.weight_cache.daemon._export_meta +
+    sglang.srt.weight_cache.ipc_loader._verify_meta). To restore the
+    upstream hard-error behavior, set SGLANG_WCD_STRICT_QUANT=1 in the
+    environment before starting the daemon / engine.
+
+    `where` is a short tag (e.g. "daemon"/"client") used only in the log
+    message.
     """
-    if is_ipc_quant_supported(quant_method, quant_config):
+    # ADR-0001 lxm.1.1: check the allowlist DIRECTLY here, not via
+    # is_ipc_quant_supported (which now defaults to True for any quant
+    # method per ADR-0001).
+    in_allowlist = quant_method in IPC_QUANT_ALLOWLIST and bool(
+        IPC_QUANT_ALLOWLIST[quant_method](quant_config)
+    )
+    if in_allowlist:
         return
     verified = ", ".join(
         (repr(m) if m else "'' (unquantized)") for m in IPC_QUANT_ALLOWLIST
     )
-    raise UnsupportedQuantForIPCError(
-        f"[weight_cache:{where}] quantization method {quant_method!r} is not "
-        f"verified for CUDA IPC zero-copy weight sharing. Its "
-        f"process_weights_after_loading may stamp Python-side metadata "
-        f"(e.g. format_ue8m0) or repack/transpose weights into shapes the "
-        f"meta-initialized client cannot reproduce, which would silently serve "
-        f"wrong-numerics weights. Verified methods: {verified}. Note: FP8 is "
-        f"only verified for block-wise configs (weight_block_size set), not "
-        f"per-tensor FP8. Disable the weight cache (--weight-cache-mode off) "
-        f"for this model."
+    if os.environ.get("SGLANG_WCD_STRICT_QUANT") == "1":
+        # Restore upstream behavior when explicitly opted in (e.g. CI smoke).
+        raise UnsupportedQuantForIPCError(
+            f"[weight_cache:{where}] quantization method {quant_method!r} is "
+            f"not verified for CUDA IPC zero-copy weight sharing. "
+            f"Verified methods: {verified}. Note: FP8 is only verified for "
+            f"block-wise configs (weight_block_size set), not per-tensor FP8. "
+            f"Disable the weight cache (--weight-cache-mode off) for this "
+            f"model."
+        )
+    logger.warning(
+        "[weight_cache:%s] quantization method %r is not on the upstream "
+        "IPC allowlist (verified: %s). Allowing through per ADR-0001; "
+        "correctness will be enforced by daemon-side _export_meta() + "
+        "client-side _verify_meta() fingerprint check. Set "
+        "SGLANG_WCD_STRICT_QUANT=1 to restore the upstream hard-error.",
+        where,
+        quant_method,
+        verified,
     )
 
 
