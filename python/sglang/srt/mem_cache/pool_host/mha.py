@@ -50,7 +50,6 @@ if _is_cuda or _is_hip:
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
-        transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
         transfer_kv_per_layer,
@@ -60,6 +59,14 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_pf_lf,
         transfer_kv_per_layer_ph_lf,
     )
+    # ole-eval h28.1: sgl-kernel 0.3.16 (installed in this venv) does not export
+    # transfer_kv_all_layer_lf_ph. It is only used by hicache_mem_layout=page_head
+    # (default is page_first which uses _pf only). Wrap in try/except so the
+    # module loads; page_head call site below still hard-fails if _ph is None.
+    try:
+        from sgl_kernel.kvcacheio import transfer_kv_all_layer_lf_ph  # noqa: F401
+    except ImportError:
+        transfer_kv_all_layer_lf_ph = None  # see comment above
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
@@ -383,6 +390,15 @@ class MHATokenToKVPoolHost(HostKVCache):
                         num_layers=self.layer_num,
                     )
             elif self.layout == "page_head":
+                # ole-eval h28.1: only available if sgl-kernel was built with _ph.
+                if transfer_kv_all_layer_lf_ph is None:
+                    raise RuntimeError(
+                        "[sglang] hicache_mem_layout=page_head requires "
+                        "sgl-kernel to export transfer_kv_all_layer_lf_ph, "
+                        "but this build doesn't have it. Either upgrade "
+                        "sgl-kernel, or set --hicache-mem-layout page_first "
+                        "(the default)."
+                    )
                 transfer_kv_all_layer_lf_ph(
                     src_k_layers=device_pool.k_data_ptrs,
                     dst_k=self.k_buffer,
