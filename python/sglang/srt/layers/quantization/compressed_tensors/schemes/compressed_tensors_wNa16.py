@@ -349,9 +349,12 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         #   -> (K/8, N*8) bf16 (in the transposed packing layout, matmul-ready)
         # ole-eval h28.12: w_q from IPC is strided (transposed storage);
         # awq_dequantize requires contiguous. Re-pack to standard (N/8, K) layout.
+        # awq_dequantize returns (qweight_rows, qweight_cols*8) = (N, K)
+        # (qweight stored as (N/8, K) packed, dequant unrolls to (N, K))
+        # F.linear(x, w_dq) computes x @ w_dq.T, so we need w_dq as (K, N).
         w_dq = awq_dequantize(w_q.contiguous(), w_s.contiguous(), w_zp.contiguous())
+        # w_dq is (N, K); transpose to (K, N) for F.linear
+        w_dq = w_dq.t().contiguous()
         x_2d = x.reshape(-1, x.shape[-1]).to(w_dq.dtype)
-        out = torch.matmul(x_2d, w_dq)
-        if bias is not None:
-            out = out + bias.to(w_dq.dtype)
+        out = torch.nn.functional.linear(x_2d, w_dq, bias)
         return out.view(*x.shape[:-1], -1)
