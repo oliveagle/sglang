@@ -86,12 +86,82 @@ if _is_cuda or _is_xpu or _is_musa:
     else:
         _flashinfer_layernorm_available = False
 
-    from sgl_kernel import (
-        fused_add_rmsnorm,
-        gemma_fused_add_rmsnorm,
-        gemma_rmsnorm,
-        rmsnorm,
+    # ole-eval h28.3 + h28.6: sgl-kernel 0.3.16+ ABI mismatch on SM80 +
+    # torch 2.11 leaves torch.ops.sgl_kernel empty. Wrap the rmsnorm /
+    # fused_add_rmsnorm / gemma_* wrappers to fall back to sglang Triton.
+    from sgl_kernel import elementwise as _sgl_kern_elem
+    from sglang.kernels.ops.layernorm.norm import (
+        rmsnorm as _triton_rmsnorm_kernel,
+        fused_add_rmsnorm as _triton_fused_add_rmsnorm_kernel,
+        _is_supported_rmsnorm_hidden_size as _jit_rmsnorm_supports,
+        is_supported_jit_fused_add_rmsnorm_hidden_size as _jit_fused_add_supports,
     )
+
+    _has_rmsnorm_cpp = hasattr(torch.ops.sgl_kernel, "rmsnorm")
+    _has_fused_add_rmsnorm_cpp = hasattr(torch.ops.sgl_kernel, "fused_add_rmsnorm")
+
+    def _torch_rmsnorm(input, weight, eps, out):
+        x = input.to(torch.float32)
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(variance + eps)
+        result = (x * weight).to(input.dtype)
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
+
+    def rmsnorm(input, weight, eps=1e-6, out=None, enable_pdl=None):
+        if _has_rmsnorm_cpp:
+            return _sgl_kern_elem.rmsnorm(input, weight, eps=eps, out=out, enable_pdl=enable_pdl)
+        if weight.dtype != input.dtype:
+            weight = weight.to(input.dtype)
+        if out is None:
+            out = torch.empty_like(input)
+        if _jit_rmsnorm_supports(input.size(-1)):
+            _triton_rmsnorm_kernel(input, weight, out=out, eps=eps)
+        else:
+            _torch_rmsnorm(input, weight, eps, out)
+        return out
+
+    def fused_add_rmsnorm(input, residual, weight, eps, *, cast_x_before_out_mul=False):
+        if _has_fused_add_rmsnorm_cpp:
+            return torch.ops.sgl_kernel.fused_add_rmsnorm(
+                input, residual, weight, eps, cast_x_before_out_mul
+            )
+        if cast_x_before_out_mul:
+            raise RuntimeError(
+                "Triton fused_add_rmsnorm fallback does not support "
+                "cast_x_before_out_mul=True; needs C++ fused_add_rmsnorm."
+            )
+        if weight.dtype != input.dtype:
+            weight = weight.to(input.dtype)
+        if _jit_fused_add_supports(input.size(-1)):
+            _triton_fused_add_rmsnorm_kernel(input, residual, weight, eps=eps)
+        else:
+            residual.add_(input)
+            _torch_rmsnorm(residual, weight, eps, input)
+        return None
+
+    from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
+        gemma_rmsnorm as _triton_gemma_rmsnorm_kernel,
+        gemma_fused_add_rmsnorm as _triton_gemma_fused_add_rmsnorm_kernel,
+    )
+    _has_gemma_rmsnorm_cpp = hasattr(torch.ops.sgl_kernel, "gemma_rmsnorm")
+    _has_gemma_fused_add_rmsnorm_cpp = hasattr(
+        torch.ops.sgl_kernel, "gemma_fused_add_rmsnorm"
+    )
+
+    def gemma_rmsnorm(input, weight, eps=1e-6, out=None, enable_pdl=None):
+        if _has_gemma_rmsnorm_cpp:
+            from sgl_kernel.elementwise import gemma_rmsnorm as _cpp_gemma
+            return _cpp_gemma(input, weight, eps=eps, out=out, enable_pdl=enable_pdl)
+        return _triton_gemma_rmsnorm_kernel(input, weight, eps)
+
+    def gemma_fused_add_rmsnorm(input, residual, weight, eps, *, enable_pdl=None):
+        if _has_gemma_fused_add_rmsnorm_cpp:
+            from sgl_kernel.elementwise import gemma_fused_add_rmsnorm as _cpp
+            return _cpp(input, residual, weight, eps, enable_pdl=enable_pdl)
+        return _triton_gemma_fused_add_rmsnorm_kernel(input, residual, weight, eps)
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False

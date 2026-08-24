@@ -147,16 +147,20 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
-        self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
+        # ole-eval patch (h28.4): do NOT apply the weight mapper to scheme maps.
+        # Scheme maps contain quant *target identifiers* (e.g. "Linear",
+        # "re:.*self_attn\..*proj"), which are NOT weight names. The
+        # WeightsMapper prepends "model." to keys with empty-prefix catchall,
+        # which corrupts quant target strings and breaks find_matched_target()
+        # (the regex no longer matches because the prefix "model.re:" is
+        # now baked in). Only ignore / sparsity_ignore_list contain actual
+        # weight-style layer names that the mapper is designed to handle.
         self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
-        self.sparsity_scheme_map = hf_to_sglang_mapper.apply_dict(
-            self.sparsity_scheme_map
-        )
         self.sparsity_ignore_list = hf_to_sglang_mapper.apply_list(
             self.sparsity_ignore_list
         )
-        if self.kv_cache_scheme is not None:
-            self.kv_cache_scheme = hf_to_sglang_mapper.apply_dict(self.kv_cache_scheme)
+        # self.target_scheme_map, self.sparsity_scheme_map, self.kv_cache_scheme
+        # intentionally NOT remapped — see comment above.
 
     def get_quant_method(
         self,

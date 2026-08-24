@@ -57,16 +57,21 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_ph_lf,
     )
-    # ole-eval h28.1: sgl-kernel 0.3.16 (installed in this venv) does not export
-    # transfer_kv_all_layer_lf_ph. It is only used by hicache_mem_layout=page_head
-    # (default is page_first which uses _pf only). Wrap in try/except so the
-    # module loads; page_head call site below still hard-fails if _ph is None.
+    # ole-eval h28.1 (fixed): sgl-kernel 0.3.16 (installed in this venv) does
+    # NOT export transfer_kv_all_layer_lf_ph / transfer_kv_per_layer_ph_lf.
+    # They are only used by hicache_mem_layout=page_head (default page_first,
+    # which uses _pf only). REMOVED from the eager import above; we try/
+    # except below. page_head call sites still hard-fail with a clear message
+    # if either kernel is None.
     try:
         from sgl_kernel.kvcacheio import transfer_kv_all_layer_lf_ph  # noqa: F401
     except ImportError:
         transfer_kv_all_layer_lf_ph = None  # see comment above
+    try:
+        from sgl_kernel.kvcacheio import transfer_kv_per_layer_ph_lf  # noqa: F401
+    except ImportError:
+        transfer_kv_per_layer_ph_lf = None  # used by page_head hicache layout
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 

@@ -378,12 +378,31 @@ class IpcModelLoader(BaseModelLoader):
                     imported_tensor.shape != ref_param.shape
                     or imported_tensor.dtype != ref_param.dtype
                 ):
-                    mismatched.append(
-                        f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
-                        f"vs model={ref_param.shape}/{ref_param.dtype}"
-                    )
-                    del imported_tensor
-                    continue
+                    # ole-eval h28.5 fix: post-quantization transforms like
+                    # gptq_marlin_repack change weight_packed from
+                    # [out, in/8] (pre-repack) to Marlin layout
+                    # [size_k/16, size_n*16/8] (post-repack). The client
+                    # skips process_weights_after_loading per ADR-0001
+                    # lxm.2.3, so its meta-init has the pre-repack shape
+                    # while the daemon has the post-repack shape. Reshape
+                    # the meta-init param storage to match the IPC shape
+                    # (safe because the IPC handle overwrites it immediately).
+                    if (
+                        ref_param.is_meta
+                        and imported_tensor.shape != ref_param.shape
+                    ):
+                        ref_param.data = torch.empty(
+                            imported_tensor.shape,
+                            dtype=ref_param.dtype,
+                            device=ref_param.device,
+                        )
+                    else:
+                        mismatched.append(
+                            f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
+                            f"vs model={ref_param.shape}/{ref_param.dtype}"
+                        )
+                        del imported_tensor
+                        continue
 
             # Replace or register the tensor in the model
             self._set_module_tensor(model, name, imported_tensor, is_param=is_param)

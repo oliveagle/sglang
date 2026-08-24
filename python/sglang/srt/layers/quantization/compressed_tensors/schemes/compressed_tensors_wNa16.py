@@ -76,6 +76,24 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         self.group_size = -1 if group_size is None else group_size
         self.has_g_idx = actorder == ActivationOrdering.GROUP
 
+        # ole-eval h28.7: set w_q/w_s/w_zp/w_gidx_name in __init__ so the
+        # attributes exist even if process_weights_after_loading is skipped
+        # (ADR-0001 lxm.2.3 zero-copy invariant on the client side).
+        self.w_q_name = "weight_packed"
+        self.w_s_name = "weight_scale"
+        self.w_zp_name = "weight_zero_point"
+        self.w_gidx_name = "weight_g_idx"
+        # workspace is set by process_weights_after_loading via
+        # marlin_make_workspace(device); when that's skipped on the client,
+        # we leave it as None (apply() will fail loudly if actually called
+        # without a workspace, since the kernels need it).
+        # ole-eval h28.7: workspace + is_k_full are normally set in
+        # process_weights_after_loading. When that's skipped (ADR-0001
+        # lxm.2.3 zero-copy invariant on the client), apply_weights
+        # computes them lazily from the layer's actual shape.
+        self.workspace = None
+        self.is_k_full = False
+
         if self.group_size == -1 and self.strategy != "channel":
             raise ValueError("Marlin kernels require group quantization or "
                              "channelwise quantization, but found no group "
@@ -208,13 +226,10 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
     # Checkpoints are serialized in compressed-tensors format, which is
     # different from the format the kernel may want. Handle repacking here.
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Default names since marlin requires empty parameters for these,
-        # TODO: remove this requirement from marlin (allow optional tensors)
-        self.w_q_name = "weight_packed"
-        self.w_s_name = "weight_scale"
-        self.w_zp_name = "weight_zero_point"
-        self.w_gidx_name = "weight_g_idx"
-
+        # w_q_name / w_s_name / w_zp_name / w_gidx_name are set in __init__
+        # so they're available even when this method is skipped (ADR-0001
+        # lxm.2.3 zero-copy invariant — client meta-init runs without
+        # process_weights_after_loading).
         device = getattr(layer, self.w_q_name).device
         c = self.kernel_config
 
@@ -321,6 +336,23 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
 
         w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
+
+        # ole-eval h28.7: workspace + is_k_full lazy init when
+        # process_weights_after_loading was skipped. Detect row-parallel
+        # from layer weight shape vs full kernel config.
+        if self.workspace is None:
+            from sglang.srt.layers.quantization.marlin_utils import (
+                marlin_make_workspace,
+            )
+            self.workspace = marlin_make_workspace(w_q.device)
+            # is_row_parallel iff input was partitioned along dim 0
+            row_parallel = (
+                c.partition_weight_shape[0] != c.full_weight_shape[0]
+            )
+            from sglang.srt.layers.quantization.marlin_utils import (
+                marlin_is_k_full,
+            )
+            self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
         # `process_weights_after_loading` will ensure w_zp and w_gidx are not
         #  None for marlin
