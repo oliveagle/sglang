@@ -345,53 +345,30 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
             self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
-        # ole-eval h28.11-h28.12 v6: try Marlin first, fall back to v5
-        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
-            apply_gptq_marlin_linear,
+        # ole-eval h28.11: bypass gptq_marlin_repack on sm_80. Marlin kernel
+        # requires size_n 64-divisible (Qwen3.8-27B-AWQ q_proj out=96 fails).
+        # Use sglang's Triton awq_dequantize (sm_80 compatible) + matmul.
+        from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
+            awq_dequantize,
         )
         if w_zp is None:
             w_zp = torch.zeros_like(w_s, dtype=torch.int32)
-        # Try Marlin (works when size_n % 64 == 0 AND no int32 compile bug)
-        if c.partition_weight_shape[1] % 64 == 0:
-            try:
-                return apply_gptq_marlin_linear(
-                    input=x,
-                    weight=w_q,
-                    weight_scale=w_s,
-                    weight_zp=w_zp,
-                    g_idx=w_gidx,
-                    g_idx_sort_indices=layer.g_idx_sort_indices,
-                    workspace=self.workspace,
-                    wtype=c.weight_type,
-                    input_size_per_partition=c.partition_weight_shape[0],
-                    output_size_per_partition=c.partition_weight_shape[1],
-                    is_k_full=self.is_k_full,
-                    bias=bias,
-                )
-            except Exception as e:
-                pass  # fall through to v5
-        # v5: pure-pytorch AWQ W4A16 dequant on sm_80
-        K_8_logical, N = w_q.shape
-        K = K_8_logical * 8
-        K_g, _ = w_s.shape
-        g = K // K_g
-        w_q_NK8 = w_q.t().contiguous()
-        q_unpacked = (w_q_NK8.view(N, K_8_logical, 8).view(torch.int32))
-        shifts = torch.arange(8, device=w_q.device, dtype=torch.int32) * 4
-        q_4bit = (q_unpacked >> shifts.view(1, 1, 8)) & 0xF
-        q_4bit_NK = q_4bit.view(N, K).to(torch.bfloat16)
-        q_4bit_KN = q_4bit_NK.t().contiguous()
-        if w_zp is not None:
-            w_zp_KgN8 = w_zp.t().contiguous()
-            zp_KgN8 = (w_zp_KgN8.view(K_g, N // 8, 8).view(torch.int32))
-            zp_4bit = (zp_KgN8 >> shifts.view(1, 1, 8)) & 0xF
-            zp_4bit = zp_4bit.view(K_g, N).to(torch.bfloat16)
-            zp_4bit = zp_4bit.repeat_interleave(g, dim=0)[:K, :N]
-            q_4bit_KN = (q_4bit_KN - zp_4bit - 8)
-        else:
-            q_4bit_KN = q_4bit_KN - 8
-        scale_full = w_s.contiguous().repeat_interleave(g, dim=0)[:K, :N]
-        w_dq = (q_4bit_KN * scale_full).to(torch.bfloat16)
+        # awq_dequantize(qweight=(K/8, N), scales=(K/g, N), qzeros=(K/g, N))
+        #   -> (K/8, N*8) bf16 (matmul-ready)
+        # ole-eval h28.12: w_q from IPC is strided; .contiguous() required.
+        w_dq = awq_dequantize(w_q.contiguous(), w_s.contiguous(), w_zp.contiguous())
+        # awq_dequantize returns (qweight_rows, qweight_cols*8) = (N, K)
+        # (qweight stored as (N/8, K) packed, dequant unrolls to (N, K))
+        # F.linear(x, w_dq) computes x @ w_dq.T, so we need w_dq as (K, N).
+        w_dq = w_dq.t().contiguous()
         x_2d = x.reshape(-1, x.shape[-1]).to(w_dq.dtype)
         out = torch.nn.functional.linear(x_2d, w_dq, bias)
         return out.view(*x.shape[:-1], -1)
+
+        # NOTE: h28.12 v3 was used in commit 5b806364 and works for the
+        # standard Marlin-style (K/8, N) layout. Qwen3.5 hybrid mamba
+        # in_proj_qkvz uses a transposed (N/8, K) layout that v3 does
+        # not handle — see h28.12 v4/v5/v6 attempts in commit history.
+        # For mamba hybrid AWQ, the upstream `awq_dequantize` kernel
+        # needs a layout adapter. Tracking as future work in
+        # docs/adr/0001-VERIFICATION_20260824_GPU0.md §6.
