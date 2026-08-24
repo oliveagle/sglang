@@ -345,69 +345,53 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
             self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
-        # ole-eval h28.11-h28.12 v5: pure-pytorch AWQ W4A16 dequant on sm_80.
-        # Layout empirically verified on Qwen3.5 hybrid 27B-AWQ (Qwen3_5ForCG):
-        #   w_q:  PHYSICAL (N, K/8) row-major, LOGICALLY labeled (K/8, N) due
-        #         to .t() (strides=[1, K/8]). Each int32 packs 8 4-bit values
-        #         along K (when logically viewed).
-        #   w_s:  (K/g, N) bf16, per-N scale (K/g groups along K)
-        #   w_zp: PHYSICAL (K/g, N/8) row-major, LOGICALLY labeled (N/8, K/g).
-        # Step 1: get w_q as logical (K/8, N) — that's just w_q.t() (no copy).
-        # Step 2: unpack each int32 along K/8 -> 8 4-bit values -> (K/8, N, 8).
-        # Step 3: combine into (K, N) by treating last 8 of (K/8, N, 8) as
-        #         the per-int32 expansion along K. Layout: (K/8, N, 8) means
-        #         for each K/8 position, N/8 separate N chunks of 8 4-bit values.
-        #         Final 4-bit matrix shape: (K, N) where K_8-th row in (K/8, N, 8)
-        #         becomes K_8*8 .. K_8*8+7 rows in (K, N).
-        # Output (N, K) bf16 weight for F.linear (Marlin-repack equivalent).
-        K_8_logical, N = w_q.shape  # logical (K/8, N) due to transposed storage
+        # ole-eval h28.11-h28.12 v6: try Marlin first, fall back to v5
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+            apply_gptq_marlin_linear,
+        )
+        if w_zp is None:
+            w_zp = torch.zeros_like(w_s, dtype=torch.int32)
+        # Try Marlin (works when size_n % 64 == 0 AND no int32 compile bug)
+        if c.partition_weight_shape[1] % 64 == 0:
+            try:
+                return apply_gptq_marlin_linear(
+                    input=x,
+                    weight=w_q,
+                    weight_scale=w_s,
+                    weight_zp=w_zp,
+                    g_idx=w_gidx,
+                    g_idx_sort_indices=layer.g_idx_sort_indices,
+                    workspace=self.workspace,
+                    wtype=c.weight_type,
+                    input_size_per_partition=c.partition_weight_shape[0],
+                    output_size_per_partition=c.partition_weight_shape[1],
+                    is_k_full=self.is_k_full,
+                    bias=bias,
+                )
+            except Exception as e:
+                pass  # fall through to v5
+        # v5: pure-pytorch AWQ W4A16 dequant on sm_80
+        K_8_logical, N = w_q.shape
         K = K_8_logical * 8
         K_g, _ = w_s.shape
         g = K // K_g
-        # 1) Unpack qweight: w_q has logical shape (K/8, N) transposed-labeled.
-        #    The element order is the same as if it were (K/8, N) — just
-        #    strides differ. We can just view w_q as (K/8, N) directly.
-        #    Each int32 along last dim packs 8 4-bit values along K.
-        #    Wait, but the storage order is (N, K/8) per strides, meaning
-        #    iterating by last-axis index jumps by K/8=640 elements in memory,
-        #    while iterating by first-axis index jumps by 1. So the 4-bit
-        #    values packed in each int32 are along the FIRST axis (K/8 logical).
-        #    So we need to view w_q as (N, K/8) and unpack along dim=1.
-        w_q_NK8 = w_q.t().contiguous()  # physical (N, K/8)
-        q_unpacked = (
-            w_q_NK8
-            .view(N, K_8_logical, 8)  # (N, K/8, 8) — last 8 are 4-bit values along K
-            .view(torch.int32)
-        )
+        w_q_NK8 = w_q.t().contiguous()
+        q_unpacked = (w_q_NK8.view(N, K_8_logical, 8).view(torch.int32))
         shifts = torch.arange(8, device=w_q.device, dtype=torch.int32) * 4
-        q_4bit = (q_unpacked >> shifts.view(1, 1, 8)) & 0xF  # (N, K/8, 8) int32
-        # q_4bit (N, K/8, 8): for each (n, k8), 8 consecutive K values.
-        # Reshape to (N, K): view (N, K/8*8) = (N, K) — last 8 of K/8 become next 8 K
-        q_4bit_NK = q_4bit.view(N, K).to(torch.bfloat16)  # (N, K) bf16
-        # F.linear(x, w) computes x @ w.T, so we need (K, N) for F.linear.
-        q_4bit_KN = q_4bit_NK.t().contiguous()  # (K, N) bf16
-        # 2) Unpack qzeros: (N/8, K/g) int32 -> (N/8, K/g, 8) int32 -> (N, K/g)
+        q_4bit = (q_unpacked >> shifts.view(1, 1, 8)) & 0xF
+        q_4bit_NK = q_4bit.view(N, K).to(torch.bfloat16)
+        q_4bit_KN = q_4bit_NK.t().contiguous()
         if w_zp is not None:
-            # w_zp has logical (N/8, K/g) but physical (K/g, N/8) transposed
-            w_zp_KgN8 = w_zp.t().contiguous()  # (K/g, N/8) physical
-            zp_KgN8 = (
-                w_zp_KgN8
-                .view(K_g, N // 8, 8)  # (K/g, N/8, 8)
-                .view(torch.int32)
-            )
-            zp_4bit = (zp_KgN8 >> shifts.view(1, 1, 8)) & 0xF  # (K/g, N/8, 8)
-            zp_4bit = zp_4bit.view(K_g, N).to(torch.bfloat16)  # (K/g, N)
-            # Repeat K/g to K
-            zp_4bit = zp_4bit.repeat_interleave(g, dim=0)[:K, :N]  # (K, N)
-            # subtract zero points + 8 (asymmetric AWQ)
+            w_zp_KgN8 = w_zp.t().contiguous()
+            zp_KgN8 = (w_zp_KgN8.view(K_g, N // 8, 8).view(torch.int32))
+            zp_4bit = (zp_KgN8 >> shifts.view(1, 1, 8)) & 0xF
+            zp_4bit = zp_4bit.view(K_g, N).to(torch.bfloat16)
+            zp_4bit = zp_4bit.repeat_interleave(g, dim=0)[:K, :N]
             q_4bit_KN = (q_4bit_KN - zp_4bit - 8)
         else:
             q_4bit_KN = q_4bit_KN - 8
-        # 3) Apply scales: w_s is (K/g, N) bf16 — repeat to (K, N)
         scale_full = w_s.contiguous().repeat_interleave(g, dim=0)[:K, :N]
-        # 4) Dequantized weight: w = (q - zp - 8) * scale
-        w_dq = (q_4bit_KN * scale_full).to(torch.bfloat16)  # (K, N) bf16
-        # 5) F.linear(x, w_dq) computes x @ w_dq.T
+        w_dq = (q_4bit_KN * scale_full).to(torch.bfloat16)
         x_2d = x.reshape(-1, x.shape[-1]).to(w_dq.dtype)
         out = torch.nn.functional.linear(x_2d, w_dq, bias)
         return out.view(*x.shape[:-1], -1)
