@@ -318,6 +318,15 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
 
         w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
+        if not hasattr(self, '_dbg_printed'):
+            import os
+            dbg_path = '/tmp/wcd_awq_test/layer_shapes.log'
+            with open(dbg_path, 'a') as f:
+                f.write(f"qshape={tuple(w_q.shape)} strides={tuple(w_q.stride())} sshape={tuple(w_s.shape)} zshape={tuple(w_zp.shape) if w_zp is not None else None} zstrides={tuple(w_zp.stride()) if w_zp is not None else None}\n")
+            self._dbg_printed = True
+        if not hasattr(self, '_dbg_printed'):
+            print(f"[WCD-DEBUG] w_q.shape={tuple(w_q.shape)} w_s.shape={tuple(w_s.shape)} w_zp.shape={tuple(w_zp.shape) if w_zp is not None else None}", flush=True)
+            self._dbg_printed = True
 
         # ole-eval h28.7: workspace + is_k_full lazy init when
         # process_weights_after_loading was skipped. Detect row-parallel
@@ -336,25 +345,69 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
             self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
-        # ole-eval h28.11: bypass gptq_marlin on sm_80. The Marlin kernel
-        # template fails to compile for int32 scalar_t (upstream bug), and
-        # size_n must be 64-divisible (Qwen3.8-27B-AWQ q_proj out=96 fails).
-        # Use sglang's Triton awq_dequantize (sm_80 compatible) + matmul.
-        from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
-            awq_dequantize,
+        # ole-eval h28.11-h28.12 v5: pure-pytorch AWQ W4A16 dequant on sm_80.
+        # Layout empirically verified on Qwen3.5 hybrid 27B-AWQ (Qwen3_5ForCG):
+        #   w_q:  PHYSICAL (N, K/8) row-major, LOGICALLY labeled (K/8, N) due
+        #         to .t() (strides=[1, K/8]). Each int32 packs 8 4-bit values
+        #         along K (when logically viewed).
+        #   w_s:  (K/g, N) bf16, per-N scale (K/g groups along K)
+        #   w_zp: PHYSICAL (K/g, N/8) row-major, LOGICALLY labeled (N/8, K/g).
+        # Step 1: get w_q as logical (K/8, N) — that's just w_q.t() (no copy).
+        # Step 2: unpack each int32 along K/8 -> 8 4-bit values -> (K/8, N, 8).
+        # Step 3: combine into (K, N) by treating last 8 of (K/8, N, 8) as
+        #         the per-int32 expansion along K. Layout: (K/8, N, 8) means
+        #         for each K/8 position, N/8 separate N chunks of 8 4-bit values.
+        #         Final 4-bit matrix shape: (K, N) where K_8-th row in (K/8, N, 8)
+        #         becomes K_8*8 .. K_8*8+7 rows in (K, N).
+        # Output (N, K) bf16 weight for F.linear (Marlin-repack equivalent).
+        K_8_logical, N = w_q.shape  # logical (K/8, N) due to transposed storage
+        K = K_8_logical * 8
+        K_g, _ = w_s.shape
+        g = K // K_g
+        # 1) Unpack qweight: w_q has logical shape (K/8, N) transposed-labeled.
+        #    The element order is the same as if it were (K/8, N) — just
+        #    strides differ. We can just view w_q as (K/8, N) directly.
+        #    Each int32 along last dim packs 8 4-bit values along K.
+        #    Wait, but the storage order is (N, K/8) per strides, meaning
+        #    iterating by last-axis index jumps by K/8=640 elements in memory,
+        #    while iterating by first-axis index jumps by 1. So the 4-bit
+        #    values packed in each int32 are along the FIRST axis (K/8 logical).
+        #    So we need to view w_q as (N, K/8) and unpack along dim=1.
+        w_q_NK8 = w_q.t().contiguous()  # physical (N, K/8)
+        q_unpacked = (
+            w_q_NK8
+            .view(N, K_8_logical, 8)  # (N, K/8, 8) — last 8 are 4-bit values along K
+            .view(torch.int32)
         )
-        if w_zp is None:
-            w_zp = torch.zeros_like(w_s, dtype=torch.int32)
-        # awq_dequantize(qweight=(K/8, N), scales=(K/g, N), qzeros=(K/g, N))
-        #   -> (K/8, N*8) bf16 (in the transposed packing layout, matmul-ready)
-        # ole-eval h28.12: w_q from IPC is strided (transposed storage);
-        # awq_dequantize requires contiguous. Re-pack to standard (N/8, K) layout.
-        # awq_dequantize returns (qweight_rows, qweight_cols*8) = (N, K)
-        # (qweight stored as (N/8, K) packed, dequant unrolls to (N, K))
-        # F.linear(x, w_dq) computes x @ w_dq.T, so we need w_dq as (K, N).
-        w_dq = awq_dequantize(w_q.contiguous(), w_s.contiguous(), w_zp.contiguous())
-        # w_dq is (N, K); transpose to (K, N) for F.linear
-        w_dq = w_dq.t().contiguous()
+        shifts = torch.arange(8, device=w_q.device, dtype=torch.int32) * 4
+        q_4bit = (q_unpacked >> shifts.view(1, 1, 8)) & 0xF  # (N, K/8, 8) int32
+        # q_4bit (N, K/8, 8): for each (n, k8), 8 consecutive K values.
+        # Reshape to (N, K): view (N, K/8*8) = (N, K) — last 8 of K/8 become next 8 K
+        q_4bit_NK = q_4bit.view(N, K).to(torch.bfloat16)  # (N, K) bf16
+        # F.linear(x, w) computes x @ w.T, so we need (K, N) for F.linear.
+        q_4bit_KN = q_4bit_NK.t().contiguous()  # (K, N) bf16
+        # 2) Unpack qzeros: (N/8, K/g) int32 -> (N/8, K/g, 8) int32 -> (N, K/g)
+        if w_zp is not None:
+            # w_zp has logical (N/8, K/g) but physical (K/g, N/8) transposed
+            w_zp_KgN8 = w_zp.t().contiguous()  # (K/g, N/8) physical
+            zp_KgN8 = (
+                w_zp_KgN8
+                .view(K_g, N // 8, 8)  # (K/g, N/8, 8)
+                .view(torch.int32)
+            )
+            zp_4bit = (zp_KgN8 >> shifts.view(1, 1, 8)) & 0xF  # (K/g, N/8, 8)
+            zp_4bit = zp_4bit.view(K_g, N).to(torch.bfloat16)  # (K/g, N)
+            # Repeat K/g to K
+            zp_4bit = zp_4bit.repeat_interleave(g, dim=0)[:K, :N]  # (K, N)
+            # subtract zero points + 8 (asymmetric AWQ)
+            q_4bit_KN = (q_4bit_KN - zp_4bit - 8)
+        else:
+            q_4bit_KN = q_4bit_KN - 8
+        # 3) Apply scales: w_s is (K/g, N) bf16 — repeat to (K, N)
+        scale_full = w_s.contiguous().repeat_interleave(g, dim=0)[:K, :N]
+        # 4) Dequantized weight: w = (q - zp - 8) * scale
+        w_dq = (q_4bit_KN * scale_full).to(torch.bfloat16)  # (K, N) bf16
+        # 5) F.linear(x, w_dq) computes x @ w_dq.T
         x_2d = x.reshape(-1, x.shape[-1]).to(w_dq.dtype)
         out = torch.nn.functional.linear(x_2d, w_dq, bias)
         return out.view(*x.shape[:-1], -1)
