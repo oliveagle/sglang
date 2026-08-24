@@ -53,7 +53,7 @@ def _fused_virtual_topk_ids_kernel(
     # GDC wait: topk_ids/token_lora_mapping come from the immediately
     # preceding routing kernels; wait before consuming them.
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     m = offs // top_k
     # k = offs % top_k  # not needed directly
@@ -165,7 +165,7 @@ def _fused_sanitize_expert_ids_kernel(
     # GDC wait: expert_ids comes from the immediately preceding align kernel;
     # wait before consuming it.
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     eid = tl.load(expert_ids_ptr + offs, mask=valid, other=0)
     result = tl.where(eid < num_virtual_experts, eid, -1)
@@ -243,7 +243,7 @@ def _moe_lora_shrink_splitk_kernel(
     # num_tokens_post_padded) come from the immediately preceding align and
     # sanitize kernels; wait before consuming them.
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)

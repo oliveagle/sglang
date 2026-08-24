@@ -178,7 +178,7 @@ def _silu_and_mul_triton_kernel(
 ):
     start_pid = tl.program_id(0)
     if USE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
     if isinstance(M_ptr, tl.tensor) and M_ptr.dtype.is_ptr():
         M = tl.load(M_ptr)
     else:

@@ -175,7 +175,7 @@ def _fused_moe_lora_kernel(
     # GDC wait waits for ALL programs in the prior kernel to complete
     # before continuing.
     if USE_GDC and not IS_PRIMARY:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     for k in range(0, grid_k):
         k_remaining = K - k * (BLOCK_SIZE_K * SPLIT_K)

@@ -96,7 +96,7 @@ def _layer_norm_fwd_1pass_kernel(
     USE_GDC: tl.constexpr = False,
 ):
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     # Map the program id to the starting row of X and Y it should compute.
     row_start = tl.program_id(0) * ROWS_PER_BLOCK

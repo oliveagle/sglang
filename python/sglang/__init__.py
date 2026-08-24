@@ -3,6 +3,18 @@
 # Install stubs early for platforms where certain dependencies are unavailable
 # (e.g. macOS/MPS has no triton, and torch.mps lacks Stream / set_device /
 # get_device_properties).  This must run before any downstream imports.
+
+# ole-eval: monkey-patch triton.language.extra.cuda.gdc_wait for triton < 3.3
+# gdc_wait is a compile-time attribute lookup in triton JIT; if missing,
+# kernel compilation fails. Add a no-op fallback.
+try:
+    import triton.language.extra.cuda as _tl_cuda
+    for _gdc_name in ('gdc_wait', 'gdc_launch_dependents', 'gdc_flush', 'gdc_wait_flush'):
+        if not hasattr(_tl_cuda, _gdc_name):
+            setattr(_tl_cuda, _gdc_name, lambda *a, **kw: None)
+except ImportError:
+    pass
+
 import platform as _platform
 import sys as _sys
 

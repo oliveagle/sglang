@@ -81,7 +81,7 @@ def _pack_topk_ids_triton_kernel(
     mask = offsets < numel
 
     if USE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     ids = tl.load(topk_ids_ptr + offsets, mask=mask, other=0)
     w = tl.load(topk_weights_ptr + offsets, mask=mask, other=0.0)

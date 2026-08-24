@@ -109,7 +109,7 @@ def _sgemm_lora_a_kernel(
     # GDC wait: ensure the prior kernel (producer of x) has fully completed
     # before consuming its output.
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)

@@ -61,7 +61,7 @@ def _sigmoid_gate_topk_renorm_kernel(
     mask_n = offs_n < N
 
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     # first (masked) tile
     raw = tl.load(

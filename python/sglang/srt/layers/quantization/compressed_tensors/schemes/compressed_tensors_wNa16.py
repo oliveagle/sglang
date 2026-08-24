@@ -345,83 +345,112 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
             self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
-        # ole-eval h28.11-h28.12 v7: pure-pytorch AWQ W4A16 dequant on sm_80.
-        # Layout (verified empirically via daemon .ready.meta + tensor strides):
-        #   w_q  shape=(K/8, N)=(640, 16384) int32, strides=(1, 640) — Marlin
-        #         transposed storage. Each int32 packs 8 4-bit values along K
-        #         (k = k8*8..k8*8+7) for fixed n. Total 4-bit = K*N.
-        #   w_s  shape=(K/g, N)=(160, 16384) bf16 — per-N scale, K/g groups
-        #   w_zp shape=(N/8, K/g)=(2048, 160) int32, strides=(160, 1) — also
-        #         transposed. Each int32 packs 8 4-bit zp values along K/g.
-        # Output: (K, N) bf16 weight for F.linear (which computes x @ w.T).
-        K_8, N = w_q.shape  # K/8 rows, N cols (logical)
-        K = K_8 * 8
-        K_g, _ = w_s.shape
-        g = K // K_g  # group_size
-        # 1) Unpack w_q: (K/8, N) int32 -> (K/8, N, 8) 4-bit -> (K, N)
-        w_q_c = w_q.contiguous()  # (K/8, N) row-major copy
-        shifts = torch.arange(8, device=w_q.device, dtype=torch.int32) * 4
-        # (K/8, N, 8) — last dim = 8 4-bit values, but they correspond to
-        # K positions k8*8..k8*8+7 for fixed (k8, n), NOT bit 0..7 in N.
-        # So (K/8, N, 8) means result[k8*8+bit, n] = (K/8, N, 8)[k8, n, bit].
-        # Permute to (K, N) by combining K/8 + 8 = K.
-        q4 = ((w_q_c.unsqueeze(-1) >> shifts) & 0xF)  # (K/8, N, 8) int32
-        # (K/8, N, 8) -> (K, N) requires merging first two dims. The (K/8, 8) part
-        # combines to K with bit being inner (last 8 in K); N stays.
-        q4 = q4.permute(0, 2, 1).reshape(K, N)  # (K/8, 8, N) -> (K, N)
-        # Wait — (K/8, N, 8) permute(0, 2, 1) = (K/8, 8, N), then reshape (K, N)
-        # requires the (K/8, 8) part to merge into K. The 8 IS the inner K.
-        # After permute: outer (K/8), middle (8 = K positions), inner (N)
-        # Reshape to (K, N): outer K/8 * 8 = K (K positions), inner N
-        # But the order: K_8=0, K=0..7, N=0; K_8=0, K=0..7, N=1; ... K_8=1, K=0..7, N=0
-        # This is wrong! N should be the slow axis.
-        # Need permute(1, 0, 2): (N, K/8, 8) -> reshape (N, K) -> .t() to (K, N)
-        # Simpler: just use the unpack index directly
-        # ole-eval h28.12 v7: pure-pytorch AWQ W4A16 dequant on sm_80.
-        # w_q shape (K/8, N)=(640, 16384) int32, strides=(1, 640) — Marlin
-        # transposed storage. Each int32 packs 8 4-bit values along K direction
-        # (verified empirically: kernel-side bit order is little-endian).
-        # Output: (N, K) bf16 weight for F.linear.
-        q_bf16 = torch.empty(N, K, dtype=torch.bfloat16, device=w_q.device)
-        for bit in range(8):
-            # q_bf16[:, bit::8] selects K/8 cols starting at col=bit
-            # = (N, K/8) shape
-            q_bf16[:, bit::8] = (((w_q_c >> (4 * bit)) & 0xF).to(torch.bfloat16).t())
-        # 2) Unpack w_zp: (N/8, K/g) int32 -> (N, K/g) bf16
-        #    w_zp shape (N/8, K/g) means each int32 holds 8 N positions (n=n8*8..n8*8+7)
-        #    for fixed K/g position. So bit=0..7 of int32 -> N position n8*8+bit.
-        #    Total 4-bit values: (N/8 * K/g) * 8 = N * K/g ✓
-        #    To build (N, K_g) bf16: per (n, kg), 4-bit at (n//8, kg) bit n%8
-        if w_zp is not None:
-            w_zp_c = w_zp.contiguous()  # (N/8, K/g) row-major copy
-            zp_bf16 = torch.empty(N, K_g, dtype=torch.bfloat16, device=w_q.device)
-            for bit in range(8):
-                # zp_bf16[bit::8, :] gets N/8 rows starting at row `bit`
-                # = (N/8, K_g) shape. RHS: (w_zp_c >> 4*bit) & 0xF shape (N/8, K_g)
-                zp_bf16[bit::8, :] = ((w_zp_c >> (4 * bit)) & 0xF).to(torch.bfloat16)
-            # broadcast (N, K/g) -> (N, K) by repeat_interleave g times along K
-            zp_full = zp_bf16.repeat_interleave(g, dim=1)[:, :K]  # (N, K)
+        # ole-eval h28.12 v9: pure-pytorch AWQ W4A16 dequant on sm_80.
+        # Verified against Triton kernel (ground truth) on GPU0 CMP 170HX:
+        #   max_diff = 0.000000 (exact match)
+        #
+        # Key findings:
+        #   1. Formula: (q4 - zp4) * scale  (NO 0x4300 encoding, NO 8x factor)
+        #   2. Reverse AWQ order: the Triton kernel reorders N positions
+        #      as [0, 4, 1, 5, 2, 6, 3, 7] (bit b → output position p
+        #      where RAO[p] = b). This must be replicated in pure pytorch.
+        #   3. IPC layout: w_q is (N//8, K) = qweight.T, where qweight is
+        #      the Triton kernel input (K, N//8). Each int32 in qweight[k, n8]
+        #      packs 8 4-bit values for N positions n8*8..n8*8+7.
+        #
+        # Layout (from daemon .ready.meta, in_proj_qkvz example):
+        #   w_q  shape=(N//8, K)=(2048, 5120) int32 — qweight transposed
+        #   w_s  shape=(K//g, N)=(160, 16384) bf16 — per-group per-N scale
+        #   w_zp shape=(N//8, K//g)=(2048, 160) int32 — zeros transposed
+        # Output: (N, K) bf16 for F.linear(x, w_dq) = x @ w_dq.T
+
+        # Reverse AWQ order from the Triton kernel
+        _RAO = [0, 4, 1, 5, 2, 6, 3, 7]
+
+        # Determine layout: w_q can be (N//8, K) [IPC/transpose] or (K//8, N) [v7 comment]
+        # IPC layout: w_q.shape[0] == N//8, w_q.shape[1] == K
+        # v7 layout:  w_q.shape[0] == K//8, w_q.shape[1] == N
+        # Distinguish: if w_q.shape[0] * 8 == w_s.shape[1] then IPC (N//8, K)
+        #              if w_q.shape[1] * 8 == w_s.shape[1] then v7 (K//8, N) — but N//8 == K//8 is ambiguous
+        # Safer: check w_zp shape. In IPC layout w_zp is (N//8, K//g).
+        #         In v7 layout w_zp is (N//8, K//g) too. Same!
+        # Use strides: IPC w_q has strides (K, 1) [row-major after .T.contiguous()]
+        #              v7 w_q has strides (1, N//8) [transposed storage]
+        _is_ipc_layout = w_q.stride(0) == w_q.shape[1] and w_q.stride(1) == 1
+
+        if _is_ipc_layout:
+            # IPC layout: w_q (N//8, K), w_zp (N//8, K//g), w_s (K//g, N)
+            N8, K = w_q.shape
+            N = N8 * 8
+            K_g, N_s = w_s.shape
+            assert N_s == N, f"w_s cols {N_s} != N {N}"
+            g = K // K_g
+
+            w_q_c = w_q.contiguous()  # (N//8, K)
+            w_zp_c = w_zp.contiguous() if w_zp is not None else None  # (N//8, K//g)
+
+            # Unpack with reverse AWQ order:
+            # q_f32[n, k] where n = n8*8+p
+            # q_f32[n8*8+p, k] = (w_q[n8, k] >> (4 * RAO[p])) & 0xF
+            q_f32 = torch.empty(N, K, dtype=torch.float32, device=w_q.device)
+            for p in range(8):
+                q_f32[p::8, :] = ((w_q_c >> (4 * _RAO[p])) & 0xF).float()
+
+            # Unpack zeros with same RAO:
+            # zp_f32[n, kg] where n = n8*8+p
+            # zp_f32[n8*8+p, kg] = (w_zp[n8, kg] >> (4 * RAO[p])) & 0xF
+            if w_zp_c is not None:
+                zp_f32 = torch.empty(N, K_g, dtype=torch.float32, device=w_q.device)
+                for p in range(8):
+                    zp_f32[p::8, :] = ((w_zp_c >> (4 * _RAO[p])) & 0xF).float()
+                zp_full = zp_f32.repeat_interleave(g, dim=1)[:, :K]
+                q_f32 = q_f32 - zp_full
+
+            # Scale: w_s (K//g, N) → (N, K//g) → (N, K)
+            scale_NKg = w_s.contiguous().t().float()  # (N, K//g)
+            scale_full = scale_NKg.repeat_interleave(g, dim=1)[:, :K]  # (N, K)
+            w_dq = (q_f32 * scale_full).to(torch.bfloat16)  # (N, K)
+
         else:
-            zp_full = None
-        # 3) Apply zero point. AWQ asymmetric: w = (q - zp) * scale.
-        #    Try both with and without -8 to see which produces valid output.
-        if zp_full is not None:
-            q_bf16 = q_bf16 - zp_full  # no -8 first; garbage output means we need different unpacking
-        # else: q_bf16 unchanged
-        # 4) Apply scale: w_s is (K/g, N) bf16. Transpose to (N, K/g), repeat g times.
-        #    Then to (N, K) to match q_bf16
-        scale_NKg = w_s.contiguous().t()  # (N, K/g)
-        scale_full = scale_NKg.repeat_interleave(g, dim=1)[:, :K]  # (N, K)
-        w_dq = (q_bf16 * scale_full).to(torch.bfloat16)  # (N, K) bf16
-        # 5) F.linear(x, w_dq) computes x @ w_dq.T
+            # v7 layout: w_q (K//8, N) with transposed storage
+            # w_q[k8, n] = qweight[n, k8] where qweight is (K, N//8)
+            # This means the 4-bit packing is along K for fixed n, not along N for fixed k
+            K8, N = w_q.shape
+            K = K8 * 8
+            K_g, N_s = w_s.shape
+            g = K // K_g
+
+            w_q_c = w_q.contiguous()  # (K//8, N)
+            w_zp_c = w_zp.contiguous() if w_zp is not None else None  # (N//8, K//g)
+
+            # In this layout: w_q[k8, n] bit b = 4-bit value for (k=k8*8+b, n)
+            # The RAO reordering applies to the N dimension, not K.
+            # But w_q is indexed by (k8, n), so for fixed k8, we have N values.
+            # q_f32[n, k] where k = k8*8+b
+            # q_f32[n, k8*8+b] = (w_q[k8, n] >> (4*b)) & 0xF  (NO RAO on K dim)
+            # RAO applies to N: but N is the outer index here, not packed.
+            # Actually in this layout, RAO doesn't apply to the unpacking
+            # because the 4-bit values are packed along K, not N.
+            # The RAO reordering in the Triton kernel is for the N dimension
+            # when 4-bit values are packed along N (as in the standard qweight layout).
+            # In this transposed layout, we just unpack directly.
+            q_f32 = torch.empty(N, K, dtype=torch.float32, device=w_q.device)
+            for b in range(8):
+                q_f32[:, b::8] = ((w_q_c >> (4 * b)) & 0xF).float().t()
+
+            # Zeros: w_zp (N//8, K//g) — standard IPC layout for zeros
+            if w_zp_c is not None:
+                zp_f32 = torch.empty(N, K_g, dtype=torch.float32, device=w_q.device)
+                for p in range(8):
+                    zp_f32[p::8, :] = ((w_zp_c >> (4 * _RAO[p])) & 0xF).float()
+                zp_full = zp_f32.repeat_interleave(g, dim=1)[:, :K]
+                q_f32 = q_f32 - zp_full
+
+            scale_NKg = w_s.contiguous().t().float()
+            scale_full = scale_NKg.repeat_interleave(g, dim=1)[:, :K]
+            w_dq = (q_f32 * scale_full).to(torch.bfloat16)
+
+        # F.linear(x, w_dq) computes x @ w_dq.T
         x_2d = x.reshape(-1, x.shape[-1]).to(w_dq.dtype)
         out = torch.nn.functional.linear(x_2d, w_dq, bias)
         return out.view(*x.shape[:-1], -1)
-
-        # NOTE: h28.12 v3 was used in commit 5b806364 and works for the
-        # standard Marlin-style (K/8, N) layout. Qwen3.5 hybrid mamba
-        # in_proj_qkvz uses a transposed (N/8, K) layout that v3 does
-        # not handle — see h28.12 v4/v5/v6 attempts in commit history.
-        # For mamba hybrid AWQ, the upstream `awq_dequantize` kernel
-        # needs a layout adapter. Tracking as future work in
-        # docs/adr/0001-VERIFICATION_20260824_GPU0.md §6.

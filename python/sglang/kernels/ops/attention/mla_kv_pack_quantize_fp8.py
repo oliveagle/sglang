@@ -48,7 +48,7 @@ def _v0_kernel(
     rope_idx = tl.arange(0, QK_ROPE)
     v_idx = tl.arange(0, V_HEAD)
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
     nope_off = (
         t_idx[:, None] * k_nope_stride_t + pid_h * k_nope_stride_h + nope_idx[None, :]
     )
@@ -105,7 +105,7 @@ def _v1_flat_kernel(
     ENABLE_PDL: tl.constexpr,
 ):
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
     pid = tl.program_id(0)
     pair_idx = pid * BLOCK + tl.arange(0, BLOCK)
     total = s_total * num_heads

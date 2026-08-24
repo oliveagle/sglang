@@ -855,7 +855,7 @@ def _static_quant_fp8(
     mask = cols < N
 
     if USE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     y_s = tl.load(y_s_ptr).to(tl.float32)

@@ -48,7 +48,7 @@ def _fp8_quantize_kernel(
     n_idx = tl.arange(0, N)
 
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     x_off = m_idx[:, None] * x_row_stride + n_idx[None, :]
     x = tl.load(x_ptr + x_off, mask=m_mask[:, None])

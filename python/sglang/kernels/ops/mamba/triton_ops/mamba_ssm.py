@@ -164,7 +164,7 @@ def _selective_scan_update_kernel(
     USE_GDC: tl.constexpr = False,
 ):
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)

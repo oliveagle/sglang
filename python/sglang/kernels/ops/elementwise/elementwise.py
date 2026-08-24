@@ -479,7 +479,7 @@ def _fused_gate_sigmoid_mul_add_kernel(
     w = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
     if USE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     h = tl.load(hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0).to(
         tl.float32

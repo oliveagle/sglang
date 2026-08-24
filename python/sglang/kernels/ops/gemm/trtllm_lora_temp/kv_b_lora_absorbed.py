@@ -191,7 +191,7 @@ def _step_a_q_kernel(
     # GDC wait: ensure the prior kernel (producer of x) has fully completed
     # before consuming its output.
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
@@ -405,7 +405,7 @@ def _step_b_q_kernel(
     # GDC wait: ensure the prior kernel (producer of x) has fully completed
     # before consuming its output.
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K_eff, BLOCK_K)):
@@ -627,7 +627,7 @@ def _step_a_v_kernel(
     # GDC wait: ensure the prior kernel (producer of x) has fully completed
     # before consuming its output.
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K, BLOCK_K)):
@@ -844,7 +844,7 @@ def _step_b_v_kernel(
     # GDC wait: ensure the prior kernel (producer of x) has fully completed
     # before consuming its output.
     if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k_block in range(0, tl.cdiv(K_eff, BLOCK_K)):

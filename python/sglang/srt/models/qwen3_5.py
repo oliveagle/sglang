@@ -18,6 +18,7 @@ import logging
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
+import os
 import torch
 import torch.nn as nn
 import triton
@@ -118,6 +119,7 @@ from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_confi
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_use_native_qk = os.environ.get("SGLANG_NATIVE_QK", "0") == "1"
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
@@ -1131,8 +1133,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
+        if _is_cuda and self.attn_output_gate and not _use_native_qk:
             q, k, v, gate = self.forward_prepare_cuda_fused(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        elif _is_cuda and self.attn_output_gate and _use_native_qk:
+            q, k, v, gate = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
             )

@@ -33,7 +33,7 @@ def set_mla_kv_buffer_kernel(
     mask = offs < total_dim
 
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     is_valid = loc % DCP_WORLD_SIZE == DCP_RANK
@@ -187,7 +187,7 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     mask = offs < total_dim
 
     if USE_GDC:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_fp8_ptr + loc * buffer_stride + offs

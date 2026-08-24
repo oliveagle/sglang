@@ -38,6 +38,9 @@ try:
     from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
     from triton_kernels.tensor import make_ragged_tensor_metadata
     from triton_kernels.topk import topk as triton_kernels_topk
+    _TRITON_KERNELS_AVAILABLE = True
+except (ImportError, AttributeError):
+    _TRITON_KERNELS_AVAILABLE = False
 
     def routing(
         logits,
@@ -47,6 +50,10 @@ try:
         simulated_ep=1,
         n_rows=None,
     ):
+        if not _TRITON_KERNELS_AVAILABLE:
+            raise RuntimeError(
+                "triton_kernels not available; MoE routing requires it"
+            )
         if simulated_ep != 1:
             raise NotImplementedError(
                 "simulated_ep routing is not supported with triton_kernels 3.6.0"

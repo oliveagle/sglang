@@ -755,7 +755,7 @@ def _fwd_kernel_stage2(
     cur_head = tl.program_id(1)
 
     if USE_PDL:
-        tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_wait()
 
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(
         kv_indptr + cur_batch
