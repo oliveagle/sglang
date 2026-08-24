@@ -347,7 +347,9 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             w_zp = torch.zeros_like(w_s, dtype=torch.int32)
         # awq_dequantize(qweight=(K/8, N), scales=(K/g, N), qzeros=(K/g, N))
         #   -> (K/8, N*8) bf16 (in the transposed packing layout, matmul-ready)
-        w_dq = awq_dequantize(w_q, w_s, w_zp)
+        # ole-eval h28.12: w_q from IPC is strided (transposed storage);
+        # awq_dequantize requires contiguous. Re-pack to standard (N/8, K) layout.
+        w_dq = awq_dequantize(w_q.contiguous(), w_s.contiguous(), w_zp.contiguous())
         x_2d = x.reshape(-1, x.shape[-1]).to(w_dq.dtype)
         out = torch.matmul(x_2d, w_dq)
         if bias is not None:
