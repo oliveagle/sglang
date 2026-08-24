@@ -556,14 +556,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
+                # ole-eval h28.8: cast to conv_states.dtype (e.g. fp16 when
+                # SGLANG_MAMBA_CONV_DTYPE=float16). Otherwise PyTorch raises
+                # "Index put requires the source and destination dtypes match"
+                # at runtime.
+                mixed_qkv_to_track = mixed_qkv_to_track.to(conv_states.dtype)
                 conv_states[forward_metadata.conv_states_mask_indices] = (
                     mixed_qkv_to_track
                 )
 
+            # ole-eval h28.8 v2+v3: causal_conv1d_fn Triton kernel needs
+            # uniform dtype across mixed_qkv, conv_weights, bias,
+            # conv_states. Cast the bf16 model weights to conv_states.dtype
+            # (typically fp16 via SGLANG_MAMBA_CONV_DTYPE). bias may be
+            # None for some GDN layers.
+            conv_target_dtype = conv_states.dtype
             mixed_qkv = causal_conv1d_fn(
-                mixed_qkv,
-                layer.conv_weights,
-                layer.bias,
+                mixed_qkv.to(conv_target_dtype),
+                layer.conv_weights.to(conv_target_dtype),
+                layer.bias.to(conv_target_dtype) if layer.bias is not None else None,
                 activation=layer.activation,
                 conv_states=conv_states_contig,
                 has_initial_state=has_initial_states,

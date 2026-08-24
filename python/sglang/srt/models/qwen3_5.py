@@ -681,7 +681,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
-        output, _ = self.out_proj(core_attn_out)
+        # ole-eval h28.9: cast to out_proj's param dtype. RowParallelLinear
+        # stores sharded weight under self.out_proj.weight but access via
+        # attribute can be intercepted by modules/__getattr__. Use
+        # named_parameters() lookup to be safe.
+        out_proj_params = dict(self.out_proj.named_parameters())
+        out_proj_dtype = next(iter(out_proj_params.values())).dtype
+        output, _ = self.out_proj(core_attn_out.to(out_proj_dtype))
         return output
 
 
