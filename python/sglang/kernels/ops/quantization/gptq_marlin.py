@@ -94,7 +94,17 @@ def gptq_marlin_gemm(
     g_idx_t = _or_empty(g_idx, device, torch.int32)
     perm_t = _or_empty(perm, device, torch.int32)
 
-    module = _jit_gptq_marlin_module(a.dtype)
+    # ole-eval h28.10: force bf16_t compile for gptq_marlin. The kernel
+    # template expects scalar_t = fp16/bf16 for input/output. When
+    # activation dtype is int32 (can happen with mixed quantization),
+    # the JIT compile fails with "ScalarType<int32_t> has no member
+    # float2num". Forcing bf16_t is safe because the actual tensor
+    # pointers are int4/int32 (weights) and bf16 (activations/outputs);
+    # the kernel reads dtype from the type alias, not the C++ tensor.
+    if a.dtype == torch.int32:
+        module = _jit_gptq_marlin_module(torch.bfloat16)
+    else:
+        module = _jit_gptq_marlin_module(a.dtype)
     module.gptq_marlin_gemm(
         a,
         b_q_weight,

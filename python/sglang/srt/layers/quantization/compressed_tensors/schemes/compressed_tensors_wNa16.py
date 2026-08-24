@@ -260,26 +260,21 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                 )
 
         def transform_w_q(x):
+            # ole-eval h28.11: skip Marlin repack on sm_80. The Marlin kernel
+            # template fails to compile for int32 scalar_t (upstream bug),
+            # so we use awq_dequantize + F.linear in apply_weights. Keep
+            # weights in raw packed layout that awq_dequantize expects:
+            # shape (K/8, N) packed int32. The g_idx permutation is still
+            # needed for correctness; apply it via permute_param_layout_.
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
-            x.data = gptq_marlin_repack(
-                x.data.contiguous(),
-                perm=layer.g_idx_sort_indices,
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                num_bits=c.weight_type.size_bits,
-            )
+            # no gptq_marlin_repack — keep raw layout
             return x
 
         def transform_w_s(x):
+            # ole-eval h28.11: skip Marlin scale permute on sm_80.
             assert isinstance(x, BasevLLMParameter)
             permute_param_layout_(x, input_dim=0, output_dim=1)
-            x.data = marlin_permute_scales(
-                x.data.contiguous(),
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                group_size=c.group_size,
-            )
             return x
 
         if c.has_g_idx:
@@ -296,21 +291,8 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             grouped_k = (
                 c.partition_weight_shape[0] // c.group_size if c.group_size != -1 else 1
             )
-            _transform_param(
-                layer,
-                self.w_zp_name,
-                lambda x: marlin_zero_points(
-                    unpack_cols(
-                        x.t(),
-                        c.weight_type.size_bits,
-                        grouped_k,
-                        c.partition_weight_shape[1],
-                    ),
-                    size_k=grouped_k,
-                    size_n=c.partition_weight_shape[1],
-                    num_bits=c.weight_type.size_bits,
-                ),
-            )
+            # ole-eval h28.11: skip Marlin zero_points repack on sm_80.
+            pass
         else:
             setattr(layer, self.w_zp_name, marlin_make_empty_g_idx(device))
         _transform_param(layer, self.w_q_name, transform_w_q)
@@ -354,19 +336,58 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
             self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
 
-        # `process_weights_after_loading` will ensure w_zp and w_gidx are not
-        #  None for marlin
-        return apply_gptq_marlin_linear(
-            input=x,
-            weight=w_q,
-            weight_scale=w_s,
-            weight_zp=w_zp,  # type: ignore
-            g_idx=w_gidx,  # type: ignore
-            g_idx_sort_indices=layer.g_idx_sort_indices,
-            workspace=self.workspace,
-            wtype=c.weight_type,
-            input_size_per_partition=c.partition_weight_shape[0],
-            output_size_per_partition=c.partition_weight_shape[1],
-            is_k_full=self.is_k_full,
-            bias=bias,
+        # ole-eval h28.11: bypass gptq_marlin on sm_80. The Marlin kernel
+        # template fails to compile for int32 scalar_t (upstream bug).
+        # Replace with dequantize + F.linear.
+        from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
+            awq_dequantize,
         )
+        size_n = c.partition_weight_shape[1]
+        size_k = c.partition_weight_shape[0]
+        num_bits = 4  # WNA16
+        if w_zp is None:
+            w_zp = torch.zeros_like(w_s, dtype=torch.int32)
+        # awq_dequantize(qweight, scales, qzeros) takes 3 args.
+        # qweight is packed (K/8, N), output is (K, N) bf16.
+        # zps/scales are already in AWQ packing layout (K/group, N).
+        # ole-eval h28.12: pure-pytorch AWQ W4A16 dequantize (Triton kernel
+        # has wrong shape expectations on sm_80). Layout: w_q (K/8, N) int32
+        # where each int32 packs 8 4-bit values along the N dim.
+        # w_s (K/group, N) bf16, w_zp (K/group, N) int32.
+        # Output: bf16 (K, N).
+        size_n_local = w_q.shape[1]
+        size_k_local = w_q.shape[0] * 8
+        group_size_local = w_s.shape[0]  # K_local / group_size
+        # Extract 4-bit values from int32 (8 per int32)
+        # Reshape to (K/8, 8, N) then take nibbles via bit-shift
+        unpacked = (
+            w_q.contiguous()
+            .view(size_k_local // 8, 8, size_n_local)
+            .view(torch.int32)
+        )
+        # shift and mask: extract bits [4i:4i+4] for i in 0..7
+        shifts = torch.tensor([4 * i for i in range(8)], device=w_q.device, dtype=torch.int32)
+        masks = torch.tensor([0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF], device=w_q.device, dtype=torch.int32)
+        unpacked = (unpacked >> shifts.view(1, 8, 1)) & masks.view(1, 8, 1)
+        # Reshape to (K, N)
+        unpacked = unpacked.view(size_k_local, size_n_local).to(torch.int32)
+        # Subtract zero points (asymmetric AWQ)
+        if w_zp is not None:
+            # w_zp is (K/group, N) packed int32 (8 per int32)
+            zp_unpacked = (
+                w_zp.contiguous()
+                .view(w_zp.shape[0], 8, w_zp.shape[1] // 8 if w_zp.shape[1] >= 8 else 1)
+                .view(torch.int32)
+            )
+            zp_unpacked = (zp_unpacked >> shifts.view(1, 8, 1)) & masks.view(1, 8, 1)
+            zp_unpacked = zp_unpacked.view(w_zp.shape[0], w_zp.shape[1]).to(torch.int32)
+            # Broadcast zp to (K, N)
+            zp_broadcast = zp_unpacked.repeat_interleave(w_q.shape[0] // w_zp.shape[0], dim=0)
+            unpacked = unpacked - zp_broadcast
+        # Apply scales
+        scales_broadcast = w_s.contiguous().repeat_interleave(w_q.shape[0] // w_s.shape[0], dim=0)
+        w_q_dq = (unpacked - 8) * scales_broadcast  # subtract 8 (zero point center) before scale
+        w_q_dq = w_q_dq.to(torch.bfloat16)
+        x_2d = x.reshape(-1, x.shape[-1]).to(w_q_dq.dtype)
+        out = torch.nn.functional.linear(x_2d, w_q_dq, bias)
+        return out.view(*x.shape[:-1], -1)
