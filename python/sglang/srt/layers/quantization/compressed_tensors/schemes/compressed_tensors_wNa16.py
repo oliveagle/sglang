@@ -318,15 +318,6 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             )
 
         w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
-        if not hasattr(self, '_dbg_printed'):
-            import os
-            dbg_path = '/tmp/wcd_awq_test/layer_shapes.log'
-            with open(dbg_path, 'a') as f:
-                f.write(f"qshape={tuple(w_q.shape)} strides={tuple(w_q.stride())} sshape={tuple(w_s.shape)} zshape={tuple(w_zp.shape) if w_zp is not None else None} zstrides={tuple(w_zp.stride()) if w_zp is not None else None}\n")
-            self._dbg_printed = True
-        if not hasattr(self, '_dbg_printed'):
-            print(f"[WCD-DEBUG] w_q.shape={tuple(w_q.shape)} w_s.shape={tuple(w_s.shape)} w_zp.shape={tuple(w_zp.shape) if w_zp is not None else None}", flush=True)
-            self._dbg_printed = True
 
         # ole-eval h28.7: workspace + is_k_full lazy init when
         # process_weights_after_loading was skipped. Detect row-parallel
@@ -367,15 +358,18 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         # Reverse AWQ order from the Triton kernel
         _RAO = [0, 4, 1, 5, 2, 6, 3, 7]
 
-        # Determine layout: w_q can be (N//8, K) [IPC/transpose] or (K//8, N) [v7 comment]
-        # IPC layout: w_q.shape[0] == N//8, w_q.shape[1] == K
-        # v7 layout:  w_q.shape[0] == K//8, w_q.shape[1] == N
-        # Distinguish: if w_q.shape[0] * 8 == w_s.shape[1] then IPC (N//8, K)
-        #              if w_q.shape[1] * 8 == w_s.shape[1] then v7 (K//8, N) — but N//8 == K//8 is ambiguous
-        # Safer: check w_zp shape. In IPC layout w_zp is (N//8, K//g).
-        #         In v7 layout w_zp is (N//8, K//g) too. Same!
-        # Use strides: IPC w_q has strides (K, 1) [row-major after .T.contiguous()]
-        #              v7 w_q has strides (1, N//8) [transposed storage]
+        # ole-eval fix 2026-08-25: detect IPC layout via stride pattern.
+        # Real WCD IPC layout (Qwen3.5 hybrid AWQ 27B on sm_80):
+        #   w_q shape=(N//8, K) int32 strides=(K, 1)         — row-major (N//8, K)
+        # The original check matched row-major (N//8, K), which is the IPC
+        # convention the daemon serializes. Earlier the check used
+        # `(stride(0)==shape[1] and stride(1)==1)` which is the same predicate
+        # spelled out — but in practice the AWQ 27B weights arrive in
+        # COLUMN-MAJOR (K//8, N) form (shape (640, 16384), strides (1, 640))
+        # because permute_param_layout_() produces that layout from the
+        # on-disk (N, K//8) storage. So _is_ipc_layout is False for our
+        # model and the v7 branch (which correctly handles (K//8, N)) runs.
+        # See tests/test_v9_vs_triton.py: max_diff=0.0 vs Triton ground truth.
         _is_ipc_layout = w_q.stride(0) == w_q.shape[1] and w_q.stride(1) == 1
 
         if _is_ipc_layout:
