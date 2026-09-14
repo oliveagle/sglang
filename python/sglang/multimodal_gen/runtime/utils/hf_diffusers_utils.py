@@ -374,7 +374,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
-        AutoConfig.register(name, cls)
+        AutoConfig.register(name, cls, exist_ok=True)
 
 
 def download_from_hf(model_path: str):

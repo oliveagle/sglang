@@ -198,7 +198,7 @@ except ImportError:
 
 for name, cls in _CONFIG_REGISTRY.items():
     try:
-        AutoConfig.register(name, cls)
+        AutoConfig.register(name, cls, exist_ok=True)
     except ValueError as e:
         err = str(e).lower()
         if "already registered" not in err and "already used" not in err:

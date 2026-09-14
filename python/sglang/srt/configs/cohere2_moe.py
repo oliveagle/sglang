@@ -118,6 +118,6 @@ class Cohere2MoeConfig(PreTrainedConfig):
 
 
 try:
-    CONFIG_MAPPING.register("cohere2_moe", Cohere2MoeConfig)
+    CONFIG_MAPPING.register("cohere2_moe", Cohere2MoeConfig, exist_ok=True)
 except Exception:
     CONFIG_MAPPING._extra_content["cohere2_moe"] = Cohere2MoeConfig

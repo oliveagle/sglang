@@ -624,6 +624,6 @@ class UnlimitedVLConfig(PretrainedConfig):
 AutoProcessor.register(UnlimitedVLConfig, UnlimitedOCRHFProcessor)
 
 try:
-    AutoConfig.register("unlimited-ocr", UnlimitedVLConfig)
+    AutoConfig.register("unlimited-ocr", UnlimitedVLConfig, exist_ok=True)
 except ValueError:
     pass

@@ -186,7 +186,7 @@ class Lfm2MoeConfig(PretrainedConfig):
 # Register with transformers CONFIG_MAPPING so AutoConfig.from_pretrained()
 # can instantiate our config class when loading models with model_type="lfm2_moe"
 try:
-    CONFIG_MAPPING.register("lfm2_moe", Lfm2MoeConfig)
+    CONFIG_MAPPING.register("lfm2_moe", Lfm2MoeConfig, exist_ok=True)
 except Exception:
     # Already registered or registration failed - use direct assignment
     CONFIG_MAPPING._extra_content["lfm2_moe"] = Lfm2MoeConfig

@@ -314,7 +314,7 @@ def register_zaya_config() -> None:
     try:
         from transformers import AutoConfig
 
-        AutoConfig.register(ZayaConfig.model_type, ZayaConfig)
+        AutoConfig.register(ZayaConfig.model_type, ZayaConfig, exist_ok=True)
     except (ValueError, ImportError):
         # Either the installed ``transformers`` does not expose
         # ``AutoConfig.register``, or the "zaya" model type is already

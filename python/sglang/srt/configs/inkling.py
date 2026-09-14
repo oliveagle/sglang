@@ -426,6 +426,6 @@ for _model_type, _config_cls in {
     "inkling_mm_model": InklingMMConfig,
 }.items():
     try:
-        CONFIG_MAPPING.register(_model_type, _config_cls)
+        CONFIG_MAPPING.register(_model_type, _config_cls, exist_ok=True)
     except Exception:
         CONFIG_MAPPING._extra_content[_model_type] = _config_cls
